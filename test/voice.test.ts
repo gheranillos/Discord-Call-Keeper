@@ -142,6 +142,95 @@ describe("VoiceCallKeeper Reconnection & Resilience Logic", () => {
     assert.equal((keeper as any).retryDelayMs, 30000, "Should stay capped at 30,000ms");
   });
 
+  it("remembers a forced reconnect requested while a connection attempt is in progress", async () => {
+    const keeper = new VoiceCallKeeper({} as any, "guild-123", "target-channel-123");
+    (keeper as any).isConnecting = true;
+
+    await keeper.connect(true);
+
+    assert.equal((keeper as any).pendingReconnect, true);
+    assert.equal((keeper as any).reconnectTimer, null);
+  });
+
+  it("schedules a quick rejoin when a disconnect was queued during connect()", () => {
+    const keeper = new VoiceCallKeeper({} as any, "guild-123", "target-channel-123");
+    (keeper as any).pendingReconnect = true;
+
+    (keeper as any).flushPendingReconnect();
+
+    assert.equal((keeper as any).pendingReconnect, false);
+    assert.equal(keeper.stats.reconnectCount, 1);
+    assert.ok((keeper as any).reconnectTimer, "a reconnect timer must be armed");
+    clearTimeout((keeper as any).reconnectTimer);
+    (keeper as any).reconnectTimer = null;
+  });
+
+  it("rejoins when Discord's cached voice state is outside the target channel", async () => {
+    const keeper = new VoiceCallKeeper(
+      {
+        user: { id: "bot-1" },
+        guilds: {
+          cache: {
+            get: () => ({
+              voiceStates: {
+                cache: {
+                  get: () => ({ channelId: null }),
+                },
+              },
+            }),
+          },
+        },
+      } as any,
+      "guild-123",
+      "target-channel-123"
+    );
+    keeper.stats.isConnected = true;
+    keeper.stats.connectedSince = new Date();
+
+    let forced = false;
+    (keeper as any).connect = async (force: boolean) => {
+      forced = force;
+    };
+
+    await (keeper as any).watchdogCheck();
+
+    assert.equal(forced, true);
+    assert.equal(keeper.stats.isConnected, false);
+    assert.equal(keeper.stats.connectedSince, null);
+    assert.equal(keeper.readCachedChannelId(), null);
+  });
+
+  it("reconnects when Discord lists the bot in the target channel but the voice socket is gone", async () => {
+    const calls: boolean[] = [];
+    const keeper = new VoiceCallKeeper(
+      {
+        user: { id: "bot-1" },
+        guilds: {
+          cache: {
+            get: () => ({
+              voiceStates: {
+                cache: {
+                  get: () => ({ channelId: "target-channel-123" }),
+                },
+              },
+            }),
+          },
+        },
+      } as any,
+      "guild-123",
+      "target-channel-123"
+    );
+    (keeper as any).connect = async (force?: boolean) => {
+      calls.push(Boolean(force));
+    };
+
+    assert.equal(keeper.readCachedChannelId(), "target-channel-123");
+
+    await (keeper as any).watchdogCheck();
+
+    assert.deepEqual(calls, [false]);
+  });
+
   it("should record lastDisconnectReason when connection error occurs", () => {
     const keeper = new VoiceCallKeeper({} as any, "guild-123", "target-channel-123");
     const conn = new MockVoiceConnection();

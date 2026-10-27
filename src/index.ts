@@ -51,13 +51,16 @@ async function main() {
     if (newState.id !== client.user?.id) return;
 
     if (!newState.channelId) {
-      // Only handle true external disconnects when not in the middle of connecting
-      if (oldState.channelId && !voiceKeeper.isConnectingState) {
-        console.warn(
-          "[Voice State] Bot was disconnected from voice channel by user/server! Triggering immediate reconnect..."
-        );
-        voiceKeeper.connect(true);
-      }
+      // A leave only counts when Discord reports the bot was in a channel, or the
+      // keeper already marked the socket as connected. The empty state sent at login
+      // has neither, including while the first join is still in progress.
+      const confirmedLeave = Boolean(oldState.channelId) || voiceKeeper.stats.isConnected;
+      if (!confirmedLeave) return;
+      console.warn(
+        "[Voice State] Bot is not in a voice channel. Rejoining the target channel..."
+      );
+      voiceKeeper.markNotInChannel("Discord removed the bot from the voice channel");
+      void voiceKeeper.connect(true);
       return;
     }
 

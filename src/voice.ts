@@ -27,6 +27,8 @@ export class VoiceCallKeeper {
   private isShuttingDown = false;
   private isConnecting = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private watchdogTimer: NodeJS.Timeout | null = null;
+  private pendingReconnect = false;
   private retryDelayMs = 5000;
 
   // Stats
@@ -57,14 +59,39 @@ export class VoiceCallKeeper {
   public async start(): Promise<void> {
     await this.connect();
 
-    // Periodic heartbeat watchdog to ensure the connection stays alive 24/7
-    setInterval(() => {
-      this.watchdogCheck();
-    }, 30_000);
+    // Check Discord's own member list, not only the local voice socket.
+    this.watchdogTimer = setInterval(() => {
+      void this.watchdogCheck();
+    }, 10_000);
+  }
+
+  public markNotInChannel(reason: string): void {
+    this.stats.isConnected = false;
+    this.stats.status = "Not in voice channel";
+    this.stats.lastDisconnectReason = reason;
+    this.stats.connectedSince = null;
+  }
+
+  /**
+   * Discord's cached voice state for this bot.
+   * `undefined` means the cache has no state yet, so the caller must not treat it as a disconnect.
+   */
+  public readCachedChannelId(): string | null | undefined {
+    const userId = this.client.user?.id;
+    if (!userId) return undefined;
+    const guild = this.client.guilds.cache.get(this.guildId);
+    if (!guild) return undefined;
+    const state = guild.voiceStates.cache.get(userId);
+    if (!state) return undefined;
+    return state.channelId ?? null;
   }
 
   public async connect(force = false): Promise<void> {
-    if (this.isShuttingDown || this.isConnecting) return;
+    if (this.isShuttingDown) return;
+    if (this.isConnecting) {
+      if (force) this.pendingReconnect = true;
+      return;
+    }
 
     // Check if we already have a healthy connection in the target channel
     const existingConn = getVoiceConnection(this.guildId);
@@ -162,10 +189,22 @@ export class VoiceCallKeeper {
       this.stats.isConnected = false;
       this.stats.status = "Connection Failed";
       this.stats.lastDisconnectReason = error?.message || String(error);
+      this.stats.connectedSince = null;
       this.scheduleReconnect();
+      this.pendingReconnect = false;
     } finally {
       this.isConnecting = false;
+      this.flushPendingReconnect();
     }
+  }
+
+  private flushPendingReconnect(): void {
+    if (!this.pendingReconnect || this.isShuttingDown) return;
+    this.pendingReconnect = false;
+    console.warn(
+      "[Voice] A disconnect arrived while a connection attempt was in progress. Rejoining..."
+    );
+    this.scheduleReconnect(1_000);
   }
 
   private setupConnectionListeners(connection: VoiceConnection): void {
@@ -237,27 +276,43 @@ export class VoiceCallKeeper {
     });
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(delayMs?: number): void {
     if (this.isShuttingDown) return;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 
+    const delay = delayMs ?? this.retryDelayMs;
+    const growBackoff = delayMs === undefined;
     this.stats.reconnectCount++;
     console.log(
-      `[Voice] Scheduling reconnect attempt #${this.stats.reconnectCount} in ${
-        this.retryDelayMs / 1000
-      }s...`
+      `[Voice] Scheduling reconnect attempt #${this.stats.reconnectCount} in ${delay / 1000}s...`
     );
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      // Exponential backoff capped at 30 seconds
-      this.retryDelayMs = Math.min(this.retryDelayMs * 1.5, 30_000);
-      this.connect();
-    }, this.retryDelayMs);
+      if (growBackoff) {
+        // Exponential backoff capped at 30 seconds
+        this.retryDelayMs = Math.min(this.retryDelayMs * 1.5, 30_000);
+      }
+      void this.connect(true);
+    }, delay);
   }
 
-  private watchdogCheck(): void {
+  private async watchdogCheck(): Promise<void> {
     if (this.isShuttingDown || this.isConnecting) return;
+
+    const actualChannelId = this.readCachedChannelId();
+    if (actualChannelId !== undefined && actualChannelId !== this.channelId) {
+      if (!this.reconnectTimer) {
+        console.warn(
+          `[Voice Watchdog] Discord lists the bot in ${
+            actualChannelId ?? "no channel"
+          }, expected ${this.channelId}. Re-joining target channel...`
+        );
+        this.markNotInChannel("Discord voice state does not match the target channel");
+        await this.connect(true);
+      }
+      return;
+    }
 
     const existingConn = getVoiceConnection(this.guildId);
     if (!existingConn) {
@@ -300,6 +355,11 @@ export class VoiceCallKeeper {
 
   public stop(): void {
     this.isShuttingDown = true;
+    this.pendingReconnect = false;
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
